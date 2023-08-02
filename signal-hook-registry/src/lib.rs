@@ -74,12 +74,14 @@ use std::ptr;
 use std::sync::ONCE_INIT;
 use std::sync::{Arc, Once};
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "espidf")))]
 use libc::{c_int, c_void, sigaction, siginfo_t};
 #[cfg(windows)]
 use libc::{c_int, sighandler_t};
+#[cfg(target_os = "espidf")]
+use libc::{c_int, c_void, sigaction};
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "espidf")))]
 use libc::{SIGFPE, SIGILL, SIGKILL, SIGSEGV, SIGSTOP};
 #[cfg(windows)]
 use libc::{SIGFPE, SIGILL, SIGSEGV};
@@ -98,9 +100,9 @@ const SIG_GET: sighandler_t = 2;
 const SIG_ERR: sighandler_t = !0;
 
 // To simplify implementation. Not to be exposed.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "espidf"))]
 #[allow(non_camel_case_types)]
-struct siginfo_t;
+pub struct siginfo_t;
 
 // # Internal workings
 //
@@ -158,19 +160,23 @@ impl Slot {
     fn new(signal: libc::c_int) -> Result<Self, Error> {
         // C data structure, expected to be zeroed out.
         let mut new: libc::sigaction = unsafe { mem::zeroed() };
-        #[cfg(not(target_os = "aix"))]
+        #[cfg(not(any(target_os = "aix", target_os = "espidf")))]
         { new.sa_sigaction = handler as usize; }
         #[cfg(target_os = "aix")]
         { new.sa_union.__su_sigaction = handler; }
-        // Android is broken and uses different int types than the rest (and different depending on
-        // the pointer width). This converts the flags to the proper type no matter what it is on
-        // the given platform.
-        let flags = libc::SA_RESTART;
-        #[allow(unused_assignments)]
-        let mut siginfo = flags;
-        siginfo = libc::SA_SIGINFO as _;
-        let flags = flags | siginfo;
-        new.sa_flags = flags as _;
+        #[cfg(target_os = "espidf")]
+        { new.sa_handler = unsafe { std::mem::transmute_copy(&handler) }; }
+        #[cfg(not(target_os = "espidf"))] {
+            // Android is broken and uses different int types than the rest (and different depending on
+            // the pointer width). This converts the flags to the proper type no matter what it is on
+            // the given platform.
+            let flags = libc::SA_RESTART;
+            #[allow(unused_assignments)]
+                let mut siginfo = flags;
+            siginfo = libc::SA_SIGINFO as _;
+            let flags = flags | siginfo;
+            new.sa_flags = flags as _;
+        }
         // C data structure, expected to be zeroed out.
         let mut old: libc::sigaction = unsafe { mem::zeroed() };
         // FFI ‒ pointers are valid, it doesn't take ownership.
@@ -235,28 +241,37 @@ impl Prev {
 
     #[cfg(not(windows))]
     unsafe fn execute(&self, sig: c_int, info: *mut siginfo_t, data: *mut c_void) {
-        #[cfg(not(target_os = "aix"))]
+        #[cfg(not(any(target_os = "aix", target_os = "espidf")))]
         let fptr = self.info.sa_sigaction;
         #[cfg(target_os = "aix")]
         let fptr = self.info.sa_union.__su_sigaction as usize;
+        #[cfg(target_os = "espidf")]
+        let fptr = std::mem::transmute(self.info.sa_handler);
         if fptr != 0 && fptr != libc::SIG_DFL && fptr != libc::SIG_IGN {
-            // Android is broken and uses different int types than the rest (and different
-            // depending on the pointer width). This converts the flags to the proper type no
-            // matter what it is on the given platform.
-            //
-            // The trick is to create the same-typed variable as the sa_flags first and then
-            // set it to the proper value (does Rust have a way to copy a type in a different
-            // way?)
-            #[allow(unused_assignments)]
-            let mut siginfo = self.info.sa_flags;
-            siginfo = libc::SA_SIGINFO as _;
-            if self.info.sa_flags & siginfo == 0 {
+            #[cfg(not(target_os = "espidf"))] {
+                // Android is broken and uses different int types than the rest (and different
+                // depending on the pointer width). This converts the flags to the proper type no
+                // matter what it is on the given platform.
+                //
+                // The trick is to create the same-typed variable as the sa_flags first and then
+                // set it to the proper value (does Rust have a way to copy a type in a different
+                // way?)
+                #[allow(unused_assignments)]
+                let mut siginfo = self.info.sa_flags;
+                siginfo = libc::SA_SIGINFO as _;
+                if self.info.sa_flags & siginfo == 0 {
+                    let action = mem::transmute::<usize, extern "C" fn(c_int)>(fptr);
+                    action(sig);
+                } else {
+                    type SigAction = extern "C" fn(c_int, *mut siginfo_t, *mut c_void);
+                    let action = mem::transmute::<usize, SigAction>(fptr);
+                    action(sig, info, data);
+                }
+            }
+
+            #[cfg(target_os = "espidf")] {
                 let action = mem::transmute::<usize, extern "C" fn(c_int)>(fptr);
                 action(sig);
-            } else {
-                type SigAction = extern "C" fn(c_int, *mut siginfo_t, *mut c_void);
-                let action = mem::transmute::<usize, SigAction>(fptr);
-                action(sig, info, data);
             }
         }
     }
@@ -394,7 +409,9 @@ pub const FORBIDDEN: &[c_int] = FORBIDDEN_IMPL;
 
 #[cfg(windows)]
 const FORBIDDEN_IMPL: &[c_int] = &[SIGILL, SIGFPE, SIGSEGV];
-#[cfg(not(windows))]
+#[cfg(target_os = "espidf")]
+const FORBIDDEN_IMPL: &[c_int] = &[];
+#[cfg(not(any(windows, target_os = "espidf")))]
 const FORBIDDEN_IMPL: &[c_int] = &[SIGKILL, SIGSTOP, SIGILL, SIGFPE, SIGSEGV];
 
 /// Registers an arbitrary action for the given signal.
